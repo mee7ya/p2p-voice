@@ -1,0 +1,11 @@
+[package]
+name = "p2p-voice"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cpal = "0.15.3"
+iced = "0.13.1"
+ringbuf = "0.4.8"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
