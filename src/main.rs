@@ -6,13 +6,14 @@ use std::panic;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, Host, Sample, Stream};
+use iced::Alignment;
 use iced::alignment::Horizontal;
 use iced::mouse::Cursor;
 use iced::widget::{button, canvas, column, combo_box, container, row, text};
-use iced::Alignment;
 use iced::{Color, Element, Rectangle, Renderer, Task, Theme, color};
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Producer, Split};
+use rubato::{FftFixedIn, Resampler};
 use tracing::{Level, error, info};
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::fmt::layer;
@@ -82,14 +83,12 @@ struct State {
     output_stream: Option<Stream>,
 }
 
-fn err_fn(err: cpal::StreamError) {
-    error!("An error occurred on stream: {}", err);
-}
-
 fn self_listen(state: &mut State) {
     state.self_listen_enabled = !state.self_listen_enabled;
 
     if state.self_listen_enabled {
+        info!(target: TRACING_TARGET, "Attempting to create streams...");
+
         let input_device: &DeviceWrapper = state.input_device.as_ref().expect("No input device");
         let output_device: &DeviceWrapper = state.output_device.as_ref().expect("No output device");
 
@@ -99,39 +98,97 @@ fn self_listen(state: &mut State) {
             .expect("No default input config")
             .into();
 
+        info!(target: TRACING_TARGET, "Input stream config has {} channel(s), {}Hz sample rate", input_config.channels, input_config.sample_rate.0);
+
         let output_config: cpal::StreamConfig = output_device
             .0
             .default_output_config()
             .expect("No default output config")
             .into();
 
-        let heap_rb = HeapRb::<f32>::new(5000);
+        info!(target: TRACING_TARGET, "Output stream config has {} channel(s), {}Hz sample rate", output_config.channels, output_config.sample_rate.0);
+
+        let input_fps: usize =
+            (input_config.sample_rate.0 as f32 * 0.01_f32 * input_config.channels as f32) as usize;
+        let heap_rb = HeapRb::<f32>::new(input_fps * 5);
         let (mut producer, mut consumer) = heap_rb.split();
 
+        let mut resampler: Option<FftFixedIn<f32>> =
+            if input_config.sample_rate != output_config.sample_rate {
+                Some(
+                    FftFixedIn::<f32>::new(
+                        input_config.sample_rate.0 as usize,
+                        output_config.sample_rate.0 as usize,
+                        input_fps / input_config.channels as usize,
+                        2,
+                        input_config.channels as usize,
+                    )
+                    .expect("Failed to create resampler"),
+                )
+            } else {
+                None
+            };
+
         let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            for &sample in data {
-                producer
-                    .try_push(sample)
-                    .expect("Failed to push to ring buffer");
-            }
+            // `data` is slice [channel_0_sample_0, channel_1_sample_0, channel_0_sample_1, channel_1_sample_1 ...]
+            producer.push_slice(data);
         };
 
         let output_data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            for sample in data {
-                *sample = match consumer.try_pop() {
-                    Some(s) => s,
-                    None => Sample::EQUILIBRIUM,
+            let mut temp_buffer: Vec<f32> = vec![Sample::EQUILIBRIUM; input_fps];
+            let popped = consumer.pop_slice(temp_buffer.as_mut_slice());
+            if popped > 0 {
+                // Have to convert stream data to [[channel_0_sample_0, channel_0_sample_1 ...], [channel_1_sample_0, channel_1_sample_1, ...], ...]
+                let mut temp_buffer = {
+                    let mut split: Vec<Vec<f32>> =
+                        vec![
+                            Vec::with_capacity(input_fps / input_config.channels as usize);
+                            input_config.channels as usize
+                        ];
+                    for (idx, sample) in temp_buffer.into_iter().enumerate() {
+                        split[idx % input_config.channels as usize].push(sample);
+                    }
+                    split
                 };
+                temp_buffer = match resampler {
+                    Some(ref mut r) => r
+                        .process(temp_buffer.as_slice(), None)
+                        .expect("Failed to resample"),
+                    None => temp_buffer,
+                };
+                // Convert back into flat representation to feed the output stream
+                let mut temp_buffer: Vec<f32> = {
+                    let mut flatten: Vec<f32> = Vec::with_capacity(temp_buffer[0].len() * temp_buffer.len());
+                    for n_sample in 0..(temp_buffer[0].len()) {
+                        for i in 0..(temp_buffer.len()) {
+                            flatten.push(temp_buffer[i][n_sample]);
+                        }
+                    }
+                    flatten
+                };
+                for (val, sample) in temp_buffer.drain(..).zip(data) {
+                    *sample = val;
+                }
             }
         };
 
         let input_stream = input_device
             .0
-            .build_input_stream(&input_config, input_data_fn, err_fn, None)
+            .build_input_stream(
+                &input_config,
+                input_data_fn,
+                |err| error!(target: TRACING_TARGET, "An error occurred on input stream: {}", err),
+                None,
+            )
             .expect("Failed to build input stream");
         let output_stream = output_device
             .0
-            .build_output_stream(&output_config, output_data_fn, err_fn, None)
+            .build_output_stream(
+                &output_config,
+                output_data_fn,
+                |err| error!(target: TRACING_TARGET, "An error occurred on output stream: {}", err),
+                None,
+            )
             .expect("Failed to build output stream");
 
         input_stream.play().expect("Failed to play input stream");
@@ -140,6 +197,8 @@ fn self_listen(state: &mut State) {
         state.input_stream = Some(input_stream);
         state.output_stream = Some(output_stream);
     } else {
+        info!(target: TRACING_TARGET, "Dropping streams");
+
         state.input_stream = None;
         state.output_stream = None;
     }
@@ -161,7 +220,9 @@ fn view(state: &State) -> Element<Message> {
                 Message::OutputDeviceChange,
             ),
             row![
-                button(text!("Test").align_x(Horizontal::Center)).width(60).on_press(Message::SelfListenPressed),
+                button(text!("Test").align_x(Horizontal::Center))
+                    .width(60)
+                    .on_press(Message::SelfListenPressed),
                 canvas(MicIcon {
                     radius: 10.0,
                     color: if state.self_listen_enabled {
@@ -172,7 +233,9 @@ fn view(state: &State) -> Element<Message> {
                 })
                 .width(25)
                 .height(25)
-            ].spacing(10).align_y(Alignment::Center),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
         ]
         .spacing(10),
     )
