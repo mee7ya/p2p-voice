@@ -5,15 +5,15 @@ use std::fs::File;
 use std::panic;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, Host, Sample, Stream};
+use cpal::{Device, Host, Sample, Stream, StreamConfig};
 use iced::Alignment;
 use iced::alignment::Horizontal;
 use iced::mouse::Cursor;
 use iced::widget::{button, canvas, column, combo_box, container, row, text};
 use iced::{Color, Element, Rectangle, Renderer, Task, Theme, color};
 use ringbuf::HeapRb;
-use ringbuf::traits::{Consumer, Producer, Split};
-use rubato::{FftFixedIn, Resampler};
+use ringbuf::traits::{Consumer, Observer, Producer, Split};
+use rubato::{FftFixedOut, Resampler};
 use tracing::{Level, error, info};
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::fmt::layer;
@@ -83,6 +83,24 @@ struct State {
     output_stream: Option<Stream>,
 }
 
+fn transform_to_resampler(input: &Vec<f32>, input_channels: usize, output: &mut Vec<Vec<f32>>) {
+    let mut idx: Vec<usize> = vec![0; input_channels];
+    for (i, val) in input.iter().enumerate() {
+        output[i % input_channels][idx[i % input_channels]] = *val;
+        idx[i % input_channels] += 1;
+    }
+}
+
+fn transform_from_resampler(input: &Vec<Vec<f32>>, output: &mut Vec<f32>) {
+    let mut output_idx: usize = 0;
+    for i in 0..input[0].len() {
+        for channel in 0..input.len() {
+            output[output_idx] = input[channel][i];
+            output_idx += 1;
+        }
+    }
+}
+
 fn self_listen(state: &mut State) {
     state.self_listen_enabled = !state.self_listen_enabled;
 
@@ -92,7 +110,7 @@ fn self_listen(state: &mut State) {
         let input_device: &DeviceWrapper = state.input_device.as_ref().expect("No input device");
         let output_device: &DeviceWrapper = state.output_device.as_ref().expect("No output device");
 
-        let input_config: cpal::StreamConfig = input_device
+        let input_config: StreamConfig = input_device
             .0
             .default_input_config()
             .expect("No default input config")
@@ -100,7 +118,7 @@ fn self_listen(state: &mut State) {
 
         info!(target: TRACING_TARGET, "Input stream config has {} channel(s), {}Hz sample rate", input_config.channels, input_config.sample_rate.0);
 
-        let output_config: cpal::StreamConfig = output_device
+        let output_config: StreamConfig = output_device
             .0
             .default_output_config()
             .expect("No default output config")
@@ -108,66 +126,98 @@ fn self_listen(state: &mut State) {
 
         info!(target: TRACING_TARGET, "Output stream config has {} channel(s), {}Hz sample rate", output_config.channels, output_config.sample_rate.0);
 
-        let input_fps: usize =
+        let input_batch: usize =
             (input_config.sample_rate.0 as f32 * 0.01_f32 * input_config.channels as f32) as usize;
-        let heap_rb = HeapRb::<f32>::new(input_fps * 5);
+        let heap_rb = HeapRb::<f32>::new(input_batch * 1000);
         let (mut producer, mut consumer) = heap_rb.split();
 
-        let mut resampler: Option<FftFixedIn<f32>> =
-            if input_config.sample_rate != output_config.sample_rate {
-                Some(
-                    FftFixedIn::<f32>::new(
-                        input_config.sample_rate.0 as usize,
-                        output_config.sample_rate.0 as usize,
-                        input_fps / input_config.channels as usize,
-                        2,
-                        input_config.channels as usize,
-                    )
-                    .expect("Failed to create resampler"),
-                )
-            } else {
-                None
-            };
+        let mut resampler: Option<FftFixedOut<f32>> = None;
+        let mut resampler_output_buffer: Option<Vec<Vec<f32>>> = None;
+        let mut resampler_input_buffer: Option<Vec<Vec<f32>>> = None;
+        let mut temp_output_buffer: Option<Vec<f32>> = None;
 
         let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
             // `data` is slice [channel_0_sample_0, channel_1_sample_0, channel_0_sample_1, channel_1_sample_1 ...]
             producer.push_slice(data);
         };
 
+        let mut temp_buffer: Vec<f32> = Vec::new();
         let output_data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            let mut temp_buffer: Vec<f32> = vec![Sample::EQUILIBRIUM; input_fps];
-            let popped = consumer.pop_slice(temp_buffer.as_mut_slice());
-            if popped > 0 {
-                // Have to convert stream data to [[channel_0_sample_0, channel_0_sample_1 ...], [channel_1_sample_0, channel_1_sample_1, ...], ...]
-                let mut temp_buffer = {
-                    let mut split: Vec<Vec<f32>> =
-                        vec![
-                            Vec::with_capacity(input_fps / input_config.channels as usize);
-                            input_config.channels as usize
+            if (temp_buffer.is_empty() && consumer.occupied_len() >= data.len())
+                || (!temp_buffer.is_empty() && consumer.occupied_len() >= temp_buffer.len())
+            {
+                if temp_buffer.is_empty() {
+                    if input_config.sample_rate != output_config.sample_rate {
+                        info!(target: TRACING_TARGET, "Sample rate mismatch, creating resampler");
+                        resampler = Some(
+                            FftFixedOut::<f32>::new(
+                                input_config.sample_rate.0 as usize,
+                                output_config.sample_rate.0 as usize,
+                                data.len() / output_config.channels as usize,
+                                1,
+                                output_config.channels as usize,
+                            )
+                            .expect("Failed to create resampler"),
+                        );
+
+                        resampler_input_buffer =
+                            Some(resampler.as_ref().unwrap().input_buffer_allocate(true));
+                        info!(target: TRACING_TARGET, "Resampler input buffer has {}x{} size", resampler_input_buffer.as_ref().unwrap().len(), resampler_input_buffer.as_ref().unwrap()[0].len());
+
+                        resampler_output_buffer =
+                            Some(resampler.as_ref().unwrap().output_buffer_allocate(true));
+                        info!(target: TRACING_TARGET, "Resampler output buffer has {}x{} size", resampler_output_buffer.as_ref().unwrap().len(), resampler_output_buffer.as_ref().unwrap()[0].len());
+
+                        temp_output_buffer =
+                            Some(vec![
+                                Sample::EQUILIBRIUM;
+                                resampler_output_buffer.as_ref().unwrap().len()
+                                    * resampler_output_buffer.as_ref().unwrap()[0].len()
+                            ]);
+
+                        temp_buffer = vec![
+                            Sample::EQUILIBRIUM;
+                            resampler.as_ref().unwrap().input_frames_max()
+                                * output_config.channels as usize
                         ];
-                    for (idx, sample) in temp_buffer.into_iter().enumerate() {
-                        split[idx % input_config.channels as usize].push(sample);
+                    } else {
+                        temp_buffer = vec![Sample::EQUILIBRIUM; data.len()];
                     }
-                    split
-                };
-                temp_buffer = match resampler {
-                    Some(ref mut r) => r
-                        .process(temp_buffer.as_slice(), None)
-                        .expect("Failed to resample"),
-                    None => temp_buffer,
-                };
-                // Convert back into flat representation to feed the output stream
-                let mut temp_buffer: Vec<f32> = {
-                    let mut flatten: Vec<f32> = Vec::with_capacity(temp_buffer[0].len() * temp_buffer.len());
-                    for n_sample in 0..(temp_buffer[0].len()) {
-                        for i in 0..(temp_buffer.len()) {
-                            flatten.push(temp_buffer[i][n_sample]);
+                    info!(target: TRACING_TARGET, "Temp buffer has {} size", temp_buffer.len());
+                    return;
+                }
+                consumer.pop_slice(temp_buffer.as_mut_slice());
+                match resampler {
+                    Some(ref mut r) => {
+                        // transform to [[channel_0_sample_0, channel_0_sample_1], [channel_1_sample_0, channel_1_sample_1], ...]
+                        transform_to_resampler(
+                            &temp_buffer,
+                            input_config.channels as usize,
+                            resampler_input_buffer.as_mut().unwrap(),
+                        );
+                        r.process_into_buffer(
+                            resampler_input_buffer.as_ref().unwrap(),
+                            resampler_output_buffer.as_mut().unwrap(),
+                            None,
+                        )
+                        .expect("Failed to resample");
+
+                        // revert transformation back for stream
+                        transform_from_resampler(
+                            resampler_output_buffer.as_ref().unwrap(),
+                            temp_output_buffer.as_mut().unwrap(),
+                        );
+                        for (sample, val) in
+                            data.iter_mut().zip(temp_output_buffer.as_ref().unwrap())
+                        {
+                            *sample = *val;
                         }
                     }
-                    flatten
-                };
-                for (val, sample) in temp_buffer.drain(..).zip(data) {
-                    *sample = val;
+                    None => {
+                        for (sample, val) in data.iter_mut().zip(&temp_buffer) {
+                            *sample = *val;
+                        }
+                    }
                 }
             }
         };
