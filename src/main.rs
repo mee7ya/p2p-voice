@@ -1,19 +1,23 @@
 #![windows_subsystem = "windows"]
 
+mod audio;
+
 use std::fmt::Debug;
 use std::fs::File;
 use std::panic;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, Host, Sample, Stream, StreamConfig};
+use audio::Playback;
+use cpal::traits::{DeviceTrait, HostTrait};
+use cpal::{Device, Host, Stream};
 use iced::Alignment;
 use iced::alignment::Horizontal;
 use iced::mouse::Cursor;
 use iced::widget::{button, canvas, column, combo_box, container, row, text};
 use iced::{Color, Element, Rectangle, Renderer, Task, Theme, color};
-use ringbuf::HeapRb;
-use ringbuf::traits::{Consumer, Observer, Producer, Split};
-use rubato::{FftFixedOut, Resampler};
 use tracing::{Level, error, info};
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::fmt::layer;
@@ -79,179 +83,6 @@ struct State {
     input_device: Option<DeviceWrapper>,
     output_device: Option<DeviceWrapper>,
     self_listen_enabled: bool,
-    input_stream: Option<Stream>,
-    output_stream: Option<Stream>,
-}
-
-fn transform_to_resampler(input: &Vec<f32>, input_channels: usize, output: &mut Vec<Vec<f32>>) {
-    let mut idx: Vec<usize> = vec![0; input_channels];
-    for (i, val) in input.iter().enumerate() {
-        output[i % input_channels][idx[i % input_channels]] = *val;
-        idx[i % input_channels] += 1;
-    }
-}
-
-fn transform_from_resampler(input: &Vec<Vec<f32>>, output: &mut Vec<f32>) {
-    let mut output_idx: usize = 0;
-    for i in 0..input[0].len() {
-        for channel in 0..input.len() {
-            output[output_idx] = input[channel][i];
-            output_idx += 1;
-        }
-    }
-}
-
-fn self_listen(state: &mut State) {
-    state.self_listen_enabled = !state.self_listen_enabled;
-
-    if state.self_listen_enabled {
-        info!(target: TRACING_TARGET, "Attempting to create streams...");
-
-        let input_device: &DeviceWrapper = state.input_device.as_ref().expect("No input device");
-        let output_device: &DeviceWrapper = state.output_device.as_ref().expect("No output device");
-
-        let input_config: StreamConfig = input_device
-            .0
-            .default_input_config()
-            .expect("No default input config")
-            .into();
-
-        info!(target: TRACING_TARGET, "Input stream config has {} channel(s), {}Hz sample rate", input_config.channels, input_config.sample_rate.0);
-
-        let output_config: StreamConfig = output_device
-            .0
-            .default_output_config()
-            .expect("No default output config")
-            .into();
-
-        info!(target: TRACING_TARGET, "Output stream config has {} channel(s), {}Hz sample rate", output_config.channels, output_config.sample_rate.0);
-
-        let input_batch: usize =
-            (input_config.sample_rate.0 as f32 * 0.01_f32 * input_config.channels as f32) as usize;
-        let heap_rb = HeapRb::<f32>::new(input_batch * 1000);
-        let (mut producer, mut consumer) = heap_rb.split();
-
-        let mut resampler: Option<FftFixedOut<f32>> = None;
-        let mut resampler_output_buffer: Option<Vec<Vec<f32>>> = None;
-        let mut resampler_input_buffer: Option<Vec<Vec<f32>>> = None;
-        let mut temp_output_buffer: Option<Vec<f32>> = None;
-
-        let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            // `data` is slice [channel_0_sample_0, channel_1_sample_0, channel_0_sample_1, channel_1_sample_1 ...]
-            producer.push_slice(data);
-        };
-
-        let mut temp_buffer: Vec<f32> = Vec::new();
-        let output_data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            if (temp_buffer.is_empty() && consumer.occupied_len() >= data.len())
-                || (!temp_buffer.is_empty() && consumer.occupied_len() >= temp_buffer.len())
-            {
-                if temp_buffer.is_empty() {
-                    if input_config.sample_rate != output_config.sample_rate {
-                        info!(target: TRACING_TARGET, "Sample rate mismatch, creating resampler");
-                        resampler = Some(
-                            FftFixedOut::<f32>::new(
-                                input_config.sample_rate.0 as usize,
-                                output_config.sample_rate.0 as usize,
-                                data.len() / output_config.channels as usize,
-                                1,
-                                output_config.channels as usize,
-                            )
-                            .expect("Failed to create resampler"),
-                        );
-
-                        resampler_input_buffer =
-                            Some(resampler.as_ref().unwrap().input_buffer_allocate(true));
-                        info!(target: TRACING_TARGET, "Resampler input buffer has {}x{} size", resampler_input_buffer.as_ref().unwrap().len(), resampler_input_buffer.as_ref().unwrap()[0].len());
-
-                        resampler_output_buffer =
-                            Some(resampler.as_ref().unwrap().output_buffer_allocate(true));
-                        info!(target: TRACING_TARGET, "Resampler output buffer has {}x{} size", resampler_output_buffer.as_ref().unwrap().len(), resampler_output_buffer.as_ref().unwrap()[0].len());
-
-                        temp_output_buffer =
-                            Some(vec![
-                                Sample::EQUILIBRIUM;
-                                resampler_output_buffer.as_ref().unwrap().len()
-                                    * resampler_output_buffer.as_ref().unwrap()[0].len()
-                            ]);
-
-                        temp_buffer = vec![
-                            Sample::EQUILIBRIUM;
-                            resampler.as_ref().unwrap().input_frames_max()
-                                * output_config.channels as usize
-                        ];
-                    } else {
-                        temp_buffer = vec![Sample::EQUILIBRIUM; data.len()];
-                    }
-                    info!(target: TRACING_TARGET, "Temp buffer has {} size", temp_buffer.len());
-                    return;
-                }
-                consumer.pop_slice(temp_buffer.as_mut_slice());
-                match resampler {
-                    Some(ref mut r) => {
-                        // transform to [[channel_0_sample_0, channel_0_sample_1], [channel_1_sample_0, channel_1_sample_1], ...]
-                        transform_to_resampler(
-                            &temp_buffer,
-                            input_config.channels as usize,
-                            resampler_input_buffer.as_mut().unwrap(),
-                        );
-                        r.process_into_buffer(
-                            resampler_input_buffer.as_ref().unwrap(),
-                            resampler_output_buffer.as_mut().unwrap(),
-                            None,
-                        )
-                        .expect("Failed to resample");
-
-                        // revert transformation back for stream
-                        transform_from_resampler(
-                            resampler_output_buffer.as_ref().unwrap(),
-                            temp_output_buffer.as_mut().unwrap(),
-                        );
-                        for (sample, val) in
-                            data.iter_mut().zip(temp_output_buffer.as_ref().unwrap())
-                        {
-                            *sample = *val;
-                        }
-                    }
-                    None => {
-                        for (sample, val) in data.iter_mut().zip(&temp_buffer) {
-                            *sample = *val;
-                        }
-                    }
-                }
-            }
-        };
-
-        let input_stream = input_device
-            .0
-            .build_input_stream(
-                &input_config,
-                input_data_fn,
-                |err| error!(target: TRACING_TARGET, "An error occurred on input stream: {}", err),
-                None,
-            )
-            .expect("Failed to build input stream");
-        let output_stream = output_device
-            .0
-            .build_output_stream(
-                &output_config,
-                output_data_fn,
-                |err| error!(target: TRACING_TARGET, "An error occurred on output stream: {}", err),
-                None,
-            )
-            .expect("Failed to build output stream");
-
-        input_stream.play().expect("Failed to play input stream");
-        output_stream.play().expect("Failed to play output stream");
-
-        state.input_stream = Some(input_stream);
-        state.output_stream = Some(output_stream);
-    } else {
-        info!(target: TRACING_TARGET, "Dropping streams");
-
-        state.input_stream = None;
-        state.output_stream = None;
-    }
 }
 
 fn view(state: &State) -> Element<Message> {
@@ -303,7 +134,31 @@ fn update(state: &mut State, message: Message) {
             state.output_device = Some(device);
             info!(target: TRACING_TARGET, "Output device changed to: {}", state.output_device.as_ref().unwrap().0.name().unwrap_or(String::from("Unknown")));
         }
-        Message::SelfListenPressed => self_listen(state),
+        Message::SelfListenPressed => {
+            state.self_listen_enabled = !state.self_listen_enabled;
+            if state.self_listen_enabled {
+                info!(target: TRACING_TARGET, "Attempting to create streams...");
+
+                // let (denoise_thread_run, input_stream, output_stream) = audio::self_listen(
+                //     &(state.input_device.as_ref().expect("No input device").0),
+                //     &(state.output_device.as_ref().expect("No output device").0),
+                // );
+
+                // state.denoise_thread_run = Some(denoise_thread_run);
+                // state.input_stream = Some(input_stream);
+                // state.output_stream = Some(output_stream);
+            } else {
+                info!(target: TRACING_TARGET, "Dropping streams");
+
+                // state
+                //     .denoise_thread_run
+                //     .as_ref()
+                //     .unwrap()
+                //     .store(false, Ordering::Relaxed);
+                // state.input_stream = None;
+                // state.output_stream = None;
+            }
+        }
     }
 }
 
@@ -329,8 +184,6 @@ fn init() -> (State, Task<Message>) {
             .default_output_device()
             .and_then(|x| Some(DeviceWrapper(x))),
         self_listen_enabled: false,
-        input_stream: None,
-        output_stream: None,
     };
     info!(
         target: TRACING_TARGET,
