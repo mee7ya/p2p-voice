@@ -5,14 +5,10 @@ mod audio;
 use std::fmt::Debug;
 use std::fs::File;
 use std::panic;
-use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
 
-use audio::Playback;
+use audio::SelfListen;
 use cpal::traits::{DeviceTrait, HostTrait};
-use cpal::{Device, Host, Stream};
+use cpal::{Device, Host};
 use iced::Alignment;
 use iced::alignment::Horizontal;
 use iced::mouse::Cursor;
@@ -82,7 +78,7 @@ struct State {
     output_devices: combo_box::State<DeviceWrapper>,
     input_device: Option<DeviceWrapper>,
     output_device: Option<DeviceWrapper>,
-    self_listen_enabled: bool,
+    self_listen: Option<SelfListen>,
 }
 
 fn view(state: &State) -> Element<Message> {
@@ -106,7 +102,7 @@ fn view(state: &State) -> Element<Message> {
                     .on_press(Message::SelfListenPressed),
                 canvas(MicIcon {
                     radius: 10.0,
-                    color: if state.self_listen_enabled {
+                    color: if state.self_listen.is_some() {
                         MIC_ICON_ENABLED
                     } else {
                         MIC_ICON_DISABLED
@@ -135,28 +131,16 @@ fn update(state: &mut State, message: Message) {
             info!(target: TRACING_TARGET, "Output device changed to: {}", state.output_device.as_ref().unwrap().0.name().unwrap_or(String::from("Unknown")));
         }
         Message::SelfListenPressed => {
-            state.self_listen_enabled = !state.self_listen_enabled;
-            if state.self_listen_enabled {
+            if state.self_listen.is_none() {
                 info!(target: TRACING_TARGET, "Attempting to create streams...");
 
-                // let (denoise_thread_run, input_stream, output_stream) = audio::self_listen(
-                //     &(state.input_device.as_ref().expect("No input device").0),
-                //     &(state.output_device.as_ref().expect("No output device").0),
-                // );
-
-                // state.denoise_thread_run = Some(denoise_thread_run);
-                // state.input_stream = Some(input_stream);
-                // state.output_stream = Some(output_stream);
+                state.self_listen = Some(audio::SelfListen::new(
+                    &state.input_device.as_ref().unwrap().0,
+                    &state.output_device.as_ref().unwrap().0,
+                ));
             } else {
                 info!(target: TRACING_TARGET, "Dropping streams");
-
-                // state
-                //     .denoise_thread_run
-                //     .as_ref()
-                //     .unwrap()
-                //     .store(false, Ordering::Relaxed);
-                // state.input_stream = None;
-                // state.output_stream = None;
+                state.self_listen = None;
             }
         }
     }
@@ -183,7 +167,7 @@ fn init() -> (State, Task<Message>) {
         output_device: host
             .default_output_device()
             .and_then(|x| Some(DeviceWrapper(x))),
-        self_listen_enabled: false,
+        self_listen: None,
     };
     info!(
         target: TRACING_TARGET,
