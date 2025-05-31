@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 cpal = "0.15.3"
 iced = {"version" = "0.13.1", "features" = ["canvas"]}
+nnnoiseless = "0.5.1"
 ringbuf = "0.4.8"
 rubato = "0.16.2"
 tracing = "0.1.41"
