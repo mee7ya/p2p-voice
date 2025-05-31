@@ -51,8 +51,8 @@ impl SelfListen {
             .into();
         info!(target: TRACING_TARGET, "Output stream config has {} channel(s), {}Hz sample rate", output_config.channels, output_config.sample_rate.0);
 
-        let (input_producer, input_consumer) = HeapRb::<f32>::new(4096).split();
-        let (denoise_producer, denoise_consumer) = HeapRb::<f32>::new(4096).split();
+        let (input_producer, input_consumer) = HeapRb::<f32>::new(16384).split();
+        let (denoise_producer, denoise_consumer) = HeapRb::<f32>::new(16384).split();
 
         let input_stream = Self::create_input_stream(input_device, &input_config, input_producer);
         let denoise_thread_run =
@@ -156,7 +156,7 @@ impl SelfListen {
                     for sample in denoise_buffer.iter_mut() {
                         *sample = input_consumer
                             .try_pop()
-                            .expect("Failed to pop from input buffer")
+                            .expect("Failed to pop from input buffer") * (i16::MAX as f32)
                     }
 
                     Self::deinterleave(channels, &denoise_buffer, &mut deinterleaved_buffer);
@@ -174,11 +174,10 @@ impl SelfListen {
                     } else {
                         for sample in denoise_buffer.iter() {
                             denoise_producer
-                                .try_push(*sample)
+                                .try_push(*sample / (i16::MAX as f32))
                                 .expect("Failed to push to denoise buffer");
                         }
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }
 
