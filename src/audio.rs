@@ -15,6 +15,7 @@ use ringbuf::{
     HeapRb,
     traits::{Consumer, Observer, Producer, Split},
 };
+use rubato::{FftFixedIn, Resampler};
 use tracing::{error, info};
 
 const TRACING_TARGET: &str = "app";
@@ -35,6 +36,7 @@ pub struct SelfListen {
     input_stream: Stream,
     output_stream: Stream,
     denoise_thread_run: Arc<AtomicBool>,
+    resampler_thread_run: Arc<AtomicBool>,
 }
 
 impl SelfListen {
@@ -52,11 +54,21 @@ impl SelfListen {
         info!(target: TRACING_TARGET, "Output stream config has {} channel(s), {}Hz sample rate", output_config.channels, output_config.sample_rate.0);
 
         let (input_producer, input_consumer) = HeapRb::<f32>::new(16384).split();
+        let (resampler_producer, resampler_consumer) = HeapRb::<f32>::new(16384).split();
         let (denoise_producer, denoise_consumer) = HeapRb::<f32>::new(16384).split();
 
         let input_stream = Self::create_input_stream(input_device, &input_config, input_producer);
-        let denoise_thread_run =
-            Self::create_denoise_thread(input_config.channels, input_consumer, denoise_producer);
+        let resampler_thread_run = Self::create_resampler_thread(
+            input_config.channels as usize,
+            input_config.sample_rate.0 as f64,
+            input_consumer,
+            resampler_producer,
+        );
+        let denoise_thread_run = Self::create_denoise_thread(
+            input_config.channels as usize,
+            resampler_consumer,
+            denoise_producer,
+        );
         let output_stream =
             Self::create_output_stream(output_device, &output_config, denoise_consumer);
 
@@ -67,6 +79,7 @@ impl SelfListen {
             input_stream,
             output_stream,
             denoise_thread_run,
+            resampler_thread_run,
         }
     }
 
@@ -130,7 +143,7 @@ impl SelfListen {
     }
 
     fn create_denoise_thread(
-        channels: u16,
+        channels: usize,
         mut input_consumer: C,
         mut denoise_producer: P,
     ) -> Arc<AtomicBool> {
@@ -140,8 +153,6 @@ impl SelfListen {
         let thread_run: Arc<AtomicBool> = denoise_thread_run.clone();
 
         thread::spawn(move || {
-            let channels = channels as usize;
-
             let mut denoise: Vec<Box<DenoiseState>> = vec![DenoiseState::new(); channels];
             let mut denoise_buffer: Vec<f32> =
                 vec![Sample::EQUILIBRIUM; DenoiseState::FRAME_SIZE * channels];
@@ -156,7 +167,8 @@ impl SelfListen {
                     for sample in denoise_buffer.iter_mut() {
                         *sample = input_consumer
                             .try_pop()
-                            .expect("Failed to pop from input buffer") * (i16::MAX as f32)
+                            .expect("Failed to pop from input buffer")
+                            * (i16::MAX as f32)
                     }
 
                     Self::deinterleave(channels, &denoise_buffer, &mut deinterleaved_buffer);
@@ -185,10 +197,69 @@ impl SelfListen {
         });
         denoise_thread_run
     }
+
+    fn create_resampler_thread(
+        channels: usize,
+        sample_rate: f64,
+        mut input_consumer: C,
+        mut resampler_producer: P,
+    ) -> Arc<AtomicBool> {
+        info!(target: TRACING_TARGET, "Starting resample thread");
+
+        let resampler_thread_run: Arc<AtomicBool> = Arc::new(true.into());
+        let thread_run: Arc<AtomicBool> = resampler_thread_run.clone();
+
+        thread::spawn(move || {
+            let resampler_chunk_size: usize = 1024;
+            let mut resampler = FftFixedIn::<f32>::new(
+                sample_rate as usize,
+                48000,
+                resampler_chunk_size,
+                1,
+                channels,
+            )
+            .expect("Failed to create input buffer");
+
+            let mut deinterleaved = resampler.input_buffer_allocate(true);
+            let mut resample_process_buffer = resampler.output_buffer_allocate(true);
+
+            let mut resampler_buffer: Vec<f32> =
+                vec![Sample::EQUILIBRIUM; resampler_chunk_size * channels];
+            let mut interleaved: Vec<f32> =
+                vec![Sample::EQUILIBRIUM; resample_process_buffer[0].len() * channels];
+
+            while thread_run.load(Ordering::Relaxed) {
+                if input_consumer.occupied_len() >= (resampler_chunk_size * channels) {
+                    for sample in resampler_buffer.iter_mut() {
+                        *sample = input_consumer
+                            .try_pop()
+                            .expect("Failed to pop from input buffer");
+                    }
+
+                    Self::deinterleave(channels, &resampler_buffer, &mut deinterleaved);
+                    resampler
+                        .process_into_buffer(&deinterleaved, &mut resample_process_buffer, None)
+                        .expect("Failed to resample");
+                    Self::interleave(&resample_process_buffer, &mut interleaved);
+
+                    for sample in interleaved.iter() {
+                        resampler_producer
+                            .try_push(*sample)
+                            .expect("Failed to push to resampler buffer");
+                    }
+                }
+            }
+
+            info!(target: TRACING_TARGET, "Stopping resample thread");
+        });
+
+        resampler_thread_run
+    }
 }
 
 impl Drop for SelfListen {
     fn drop(&mut self) {
         self.denoise_thread_run.store(false, Ordering::Relaxed);
+        self.resampler_thread_run.store(false, Ordering::Relaxed);
     }
 }
