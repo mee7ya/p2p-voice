@@ -36,7 +36,8 @@ pub struct SelfListen {
     input_stream: Stream,
     output_stream: Stream,
     denoise_thread_run: Arc<AtomicBool>,
-    resampler_thread_run: Arc<AtomicBool>,
+    resampler_input_thread_run: Arc<AtomicBool>,
+    resampler_output_thread_run: Arc<AtomicBool>,
 }
 
 impl SelfListen {
@@ -53,24 +54,21 @@ impl SelfListen {
             .into();
         info!(target: TRACING_TARGET, "Output stream config has {} channel(s), {}Hz sample rate", output_config.channels, output_config.sample_rate.0);
 
-        let (input_producer, input_consumer) = HeapRb::<f32>::new(16384).split();
-        let (resampler_producer, resampler_consumer) = HeapRb::<f32>::new(16384).split();
-        let (denoise_producer, denoise_consumer) = HeapRb::<f32>::new(16384).split();
+        let (input_producer, input_consumer) = HeapRb::<f32>::new(8192 * 2).split();
+        let (resampler_input_producer, resampler_input_consumer) = HeapRb::<f32>::new(8192 * 2).split();
+        let (denoise_producer, denoise_consumer) = HeapRb::<f32>::new(8192 * 2).split();
+        let (resampler_output_producer, resampler_output_consumer) = HeapRb::<f32>::new(8192 * 2).split();
 
         let input_stream = Self::create_input_stream(input_device, &input_config, input_producer);
-        let resampler_thread_run = Self::create_resampler_thread(
-            input_config.channels as usize,
-            input_config.sample_rate.0 as f64,
-            input_consumer,
-            resampler_producer,
-        );
+        let resampler_input_thread_run = Self::create_resampler_thread(input_config.channels as usize, input_config.sample_rate.0 as usize, 48000_usize, input_consumer, resampler_input_producer);
         let denoise_thread_run = Self::create_denoise_thread(
             input_config.channels as usize,
-            resampler_consumer,
+            resampler_input_consumer,
             denoise_producer,
         );
+        let resampler_output_thread_run = Self::create_resampler_thread(input_config.channels as usize, 48000_usize, output_config.sample_rate.0 as usize, denoise_consumer, resampler_output_producer);
         let output_stream =
-            Self::create_output_stream(output_device, &output_config, denoise_consumer);
+            Self::create_output_stream(output_device, &output_config, resampler_output_consumer);
 
         input_stream.play().expect("Failed to play input stream");
         output_stream.play().expect("Failed to play output stream");
@@ -79,7 +77,8 @@ impl SelfListen {
             input_stream,
             output_stream,
             denoise_thread_run,
-            resampler_thread_run,
+            resampler_input_thread_run,
+            resampler_output_thread_run,
         }
     }
 
@@ -108,6 +107,9 @@ impl SelfListen {
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     // `data` is slice [channel_0_sample_0, channel_1_sample_0, channel_0_sample_1, channel_1_sample_1 ...]
                     for sample in data {
+                        if input_producer.is_full() {
+                            continue;
+                        }
                         input_producer
                             .try_push(*sample)
                             .expect("Failed to push to input buffer");
@@ -122,18 +124,14 @@ impl SelfListen {
     fn create_output_stream(
         output_device: &Device,
         output_config: &StreamConfig,
-        mut denoise_consumer: C,
+        mut resampler_consumer: C,
     ) -> Stream {
         output_device
             .build_output_stream(
                 output_config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    if denoise_consumer.occupied_len() >= data.len() {
-                        for sample in data.iter_mut() {
-                            *sample = denoise_consumer
-                                .try_pop()
-                                .expect("Failed to pop from denoise buffer");
-                        }
+                    for sample in data.iter_mut() {
+                        *sample = resampler_consumer.try_pop().unwrap_or(Sample::EQUILIBRIUM);
                     }
                 },
                 |err| error!(target: TRACING_TARGET, "An error occurred on input stream: {err}"),
@@ -185,6 +183,9 @@ impl SelfListen {
                         denoise_first = false;
                     } else {
                         for sample in denoise_buffer.iter() {
+                            if denoise_producer.is_full() {
+                                continue;
+                            }
                             denoise_producer
                                 .try_push(*sample / (i16::MAX as f32))
                                 .expect("Failed to push to denoise buffer");
@@ -200,7 +201,8 @@ impl SelfListen {
 
     fn create_resampler_thread(
         channels: usize,
-        sample_rate: f64,
+        input_sample_rate: usize,
+        output_sample_rate: usize,
         mut input_consumer: C,
         mut resampler_producer: P,
     ) -> Arc<AtomicBool> {
@@ -210,10 +212,10 @@ impl SelfListen {
         let thread_run: Arc<AtomicBool> = resampler_thread_run.clone();
 
         thread::spawn(move || {
-            let resampler_chunk_size: usize = 1024;
+            let resampler_chunk_size: usize = 960;
             let mut resampler = FftFixedIn::<f32>::new(
-                sample_rate as usize,
-                48000,
+                input_sample_rate,
+                output_sample_rate,
                 resampler_chunk_size,
                 1,
                 channels,
@@ -243,6 +245,9 @@ impl SelfListen {
                     Self::interleave(&resample_process_buffer, &mut interleaved);
 
                     for sample in interleaved.iter() {
+                        if resampler_producer.is_full() {
+                            continue;
+                        }
                         resampler_producer
                             .try_push(*sample)
                             .expect("Failed to push to resampler buffer");
@@ -260,6 +265,7 @@ impl SelfListen {
 impl Drop for SelfListen {
     fn drop(&mut self) {
         self.denoise_thread_run.store(false, Ordering::Relaxed);
-        self.resampler_thread_run.store(false, Ordering::Relaxed);
+        self.resampler_input_thread_run.store(false, Ordering::Relaxed);
+        self.resampler_output_thread_run.store(false, Ordering::Relaxed);
     }
 }
