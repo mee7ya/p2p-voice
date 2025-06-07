@@ -5,6 +5,7 @@ pub enum Message {
     InputDeviceChange(DeviceWrapper),
     OutputDeviceChange(DeviceWrapper),
     PeerAddressChange(String),
+    TabSelected(String),
     PeerConnect,
     SelfListenPressed,
 }

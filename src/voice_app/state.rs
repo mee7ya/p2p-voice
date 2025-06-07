@@ -9,4 +9,5 @@ pub struct State {
     pub output_device: Option<DeviceWrapper>,
     pub self_listen: Option<SelfListen>,
     pub peer_address: String,
+    pub active_tab: String,
 }

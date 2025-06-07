@@ -3,18 +3,26 @@ use cpal::{
     traits::{DeviceTrait, HostTrait},
 };
 use iced::{
-    Alignment, Element, Padding, Size, Task,
-    alignment::Horizontal,
-    widget::{button, canvas, column, combo_box, container, row, text, text_input},
+    Alignment, Element, Length, Padding, Size, Task, Theme,
+    alignment::{Horizontal, Vertical},
+    widget::{
+        button, canvas, column, combo_box, container, horizontal_rule, row, text, text_input,
+    },
 };
+use iced_aw::{TabBar, TabLabel, Tabs, style::tab_bar};
 use tracing::info;
 
 use crate::voice_app::{
     app_tracing::TRACING_TARGET,
+    app_type::{VoiceAppButton, VoiceAppComboBox, VoiceAppTabBar},
     audio,
     message::Message,
     mic_icon::{MIC_ICON_DISABLED, MIC_ICON_ENABLED, MicIcon},
     state::State,
+    style::{
+        BUTTON_HEIGHT, BUTTON_TEXT_SIZE, BUTTON_WIDTH, COMBO_BOX_TEXT_SIZE, TABS_HEIGHT,
+        TABS_TEXT_SIZE, tabs_style, theme,
+    },
     wrapper::DeviceWrapper,
 };
 
@@ -52,6 +60,7 @@ impl VoiceApp {
                 .and_then(|x| Some(DeviceWrapper(x))),
             self_listen: None,
             peer_address: String::new(),
+            active_tab: String::from("Action"),
         };
         info!(
             target: TRACING_TARGET,
@@ -71,57 +80,61 @@ impl VoiceApp {
     }
 
     fn view(state: &State) -> Element<Message> {
-        container(column![
-            column![
-                combo_box(
-                    &state.input_devices,
-                    "Select input device...",
-                    state.input_device.as_ref(),
-                    Message::InputDeviceChange,
-                ),
-                combo_box(
-                    &state.output_devices,
-                    "Select output device...",
-                    state.output_device.as_ref(),
-                    Message::OutputDeviceChange,
-                ),
-                row![
-                    button(text!("Test").align_x(Horizontal::Center))
-                        .width(60)
-                        .on_press(Message::SelfListenPressed),
-                    canvas(MicIcon {
-                        radius: 10.0,
-                        color: if state.self_listen.is_some() {
-                            MIC_ICON_ENABLED
-                        } else {
-                            MIC_ICON_DISABLED
-                        }
-                    })
-                    .width(25)
-                    .height(25)
-                ]
-                .spacing(10)
-                .align_y(Alignment::Center),
-            ]
-            .spacing(10),
-            column![
+        let input_combo_box: VoiceAppComboBox = combo_box(
+            &state.input_devices,
+            "Select input device...",
+            state.input_device.as_ref(),
+            Message::InputDeviceChange,
+        )
+        .size(COMBO_BOX_TEXT_SIZE);
+
+        let output_combo_box: VoiceAppComboBox = combo_box(
+            &state.output_devices,
+            "Select output device...",
+            state.output_device.as_ref(),
+            Message::OutputDeviceChange,
+        )
+        .size(COMBO_BOX_TEXT_SIZE);
+
+        let test_button: VoiceAppButton = button(
+            text!("Test")
+                .size(BUTTON_TEXT_SIZE)
+                .align_x(Horizontal::Center)
+                .align_y(Vertical::Center),
+        )
+        .width(BUTTON_WIDTH)
+        .height(BUTTON_HEIGHT)
+        .on_press(Message::SelfListenPressed);
+
+        let tabs: VoiceAppTabBar = Tabs::new(Message::TabSelected)
+            .push(
+                String::from("Main"),
+                TabLabel::Text(String::from("Main")),
+                column![],
+            )
+            .push(
+                String::from("Settings"),
+                TabLabel::Text(String::from("Settings")),
                 column![
+                    input_combo_box,
+                    output_combo_box,
+                    row![test_button].spacing(10).align_y(Alignment::Center),
+                    horizontal_rule(2),
                     text_input("Peer address...", &state.peer_address)
                         .on_input(Message::PeerAddressChange),
-                    button(text!("Connect").align_x(Horizontal::Center))
-                        .on_press(Message::SelfListenPressed)
                 ]
-                .spacing(10)
-            ]
-            .padding(Padding {
-                top: 25.0,
-                right: 0.0,
-                bottom: 0.0,
-                left: 0.0
-            })
-        ])
-        .padding(15)
-        .into()
+                .padding(10)
+                .spacing(10),
+            )
+            .tab_bar_style(tabs_style)
+            .tab_bar_height(TABS_HEIGHT)
+            .text_size(TABS_TEXT_SIZE)
+            .tab_label_padding(0)
+            .set_active_tab(&state.active_tab);
+
+        let app_container = container(tabs);
+
+        app_container.into()
     }
 
     fn update(state: &mut State, message: Message) {
@@ -138,6 +151,9 @@ impl VoiceApp {
                 state.peer_address = peer_address;
             }
             Message::PeerConnect => {}
+            Message::TabSelected(tab) => {
+                state.active_tab = tab;
+            }
             Message::SelfListenPressed => {
                 if state.self_listen.is_none() {
                     info!(target: TRACING_TARGET, "Attempting to create streams...");
@@ -156,7 +172,8 @@ impl VoiceApp {
 
     pub fn run(&self) {
         iced::application("Voice", Self::update, Self::view)
-            .window_size((400.0, 300.0))
+            .theme(theme)
+            .window_size(self.window_size)
             .antialiasing(true)
             .run_with(Self::init)
             .expect("Failed to run application");
