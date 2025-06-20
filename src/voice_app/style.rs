@@ -46,6 +46,14 @@ pub const COMBO_BOX_TEXT_SIZE: f32 = 14.0;
 
 // Button
 pub const BUTTON_TEXT_SIZE: f32 = 14.0;
-pub const BUTTON_WIDTH: f32 = 55.0;
-pub const BUTTON_HEIGHT: f32 = 25.0;
+pub const SELF_LISTEN_BUTTON_WIDTH: f32 = 55.0;
+pub const SELF_LISTEN_BUTTON_HEIGHT: f32 = 25.0;
+
+pub const CONNECT_BUTTON_WIDTH: f32 = 90.0;
+pub const CONNECT_BUTTON_HEIGHT: f32 = 40.0;
+//
+
+// Mic Icon
+pub const MIC_ICON_HEIGHT: f32 = 25.0;
+pub const MIC_ICON_WIDTH: f32 = 25.0;
 //

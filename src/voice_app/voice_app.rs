@@ -3,25 +3,24 @@ use cpal::{
     traits::{DeviceTrait, HostTrait},
 };
 use iced::{
-    Alignment, Element, Length, Padding, Size, Task, Theme,
+    Alignment, Element, Size, Task,
     alignment::{Horizontal, Vertical},
     widget::{
         button, canvas, column, combo_box, container, horizontal_rule, row, text, text_input,
     },
 };
-use iced_aw::{TabBar, TabLabel, Tabs, style::tab_bar};
+use iced_aw::{TabLabel, Tabs};
 use tracing::info;
 
 use crate::voice_app::{
     app_tracing::TRACING_TARGET,
-    app_type::{VoiceAppButton, VoiceAppComboBox, VoiceAppTabBar},
+    app_type::{VoiceAppButton, VoiceAppDeviceComboBox, VoiceAppMicIcon, VoiceAppTabBar},
     audio,
     message::Message,
-    mic_icon::{MIC_ICON_DISABLED, MIC_ICON_ENABLED, MicIcon},
+    mic_icon::{MicIcon, MIC_ICON_DISABLED, MIC_ICON_ENABLED},
     state::State,
     style::{
-        BUTTON_HEIGHT, BUTTON_TEXT_SIZE, BUTTON_WIDTH, COMBO_BOX_TEXT_SIZE, TABS_HEIGHT,
-        TABS_TEXT_SIZE, tabs_style, theme,
+        tabs_style, theme, BUTTON_TEXT_SIZE, COMBO_BOX_TEXT_SIZE, CONNECT_BUTTON_HEIGHT, CONNECT_BUTTON_WIDTH, MIC_ICON_HEIGHT, MIC_ICON_WIDTH, SELF_LISTEN_BUTTON_HEIGHT, SELF_LISTEN_BUTTON_WIDTH, TABS_HEIGHT, TABS_TEXT_SIZE
     },
     wrapper::DeviceWrapper,
 };
@@ -80,7 +79,7 @@ impl VoiceApp {
     }
 
     fn view(state: &State) -> Element<Message> {
-        let input_combo_box: VoiceAppComboBox = combo_box(
+        let input_combo_box: VoiceAppDeviceComboBox = combo_box(
             &state.input_devices,
             "Select input device...",
             state.input_device.as_ref(),
@@ -88,7 +87,7 @@ impl VoiceApp {
         )
         .size(COMBO_BOX_TEXT_SIZE);
 
-        let output_combo_box: VoiceAppComboBox = combo_box(
+        let output_combo_box: VoiceAppDeviceComboBox = combo_box(
             &state.output_devices,
             "Select output device...",
             state.output_device.as_ref(),
@@ -102,15 +101,42 @@ impl VoiceApp {
                 .align_x(Horizontal::Center)
                 .align_y(Vertical::Center),
         )
-        .width(BUTTON_WIDTH)
-        .height(BUTTON_HEIGHT)
+        .width(SELF_LISTEN_BUTTON_WIDTH)
+        .height(SELF_LISTEN_BUTTON_HEIGHT)
         .on_press(Message::SelfListenPressed);
+
+        let mic_icon: VoiceAppMicIcon = canvas(MicIcon {
+            radius: 10.0,
+            color: if state.self_listen.is_some() {
+                MIC_ICON_ENABLED
+            } else {
+                MIC_ICON_DISABLED
+            },
+        })
+        .width(MIC_ICON_WIDTH)
+        .height(MIC_ICON_HEIGHT);
+
+        let connect_button: VoiceAppButton = button(
+            text!("Connect")
+                .size(BUTTON_TEXT_SIZE)
+                .align_x(Horizontal::Center)
+                .align_y(Vertical::Center),
+        )
+        .width(CONNECT_BUTTON_WIDTH)
+        .height(CONNECT_BUTTON_HEIGHT)
+        .on_press(Message::PeerConnect);
 
         let tabs: VoiceAppTabBar = Tabs::new(Message::TabSelected)
             .push(
                 String::from("Main"),
                 TabLabel::Text(String::from("Main")),
-                column![],
+                column![
+                    row![connect_button]
+                        .height(iced::Length::Fill)
+                        .align_y(Vertical::Center)
+                ]
+                .width(iced::Length::Fill)
+                .align_x(Horizontal::Center),
             )
             .push(
                 String::from("Settings"),
@@ -118,7 +144,9 @@ impl VoiceApp {
                 column![
                     input_combo_box,
                     output_combo_box,
-                    row![test_button].spacing(10).align_y(Alignment::Center),
+                    row![test_button, mic_icon]
+                        .spacing(10)
+                        .align_y(Alignment::Center),
                     horizontal_rule(2),
                     text_input("Peer address...", &state.peer_address)
                         .on_input(Message::PeerAddressChange),
