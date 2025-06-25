@@ -8,6 +8,7 @@ cpal = "0.16.0"
 iced = {"version" = "0.13.1", "features" = ["canvas"]}
 iced_aw = {"version" = "0.12.2", default-features = false, "features" = ["tab_bar", "tabs"]}
 nnnoiseless = "0.5.1"
+opus = "0.3.0"
 ringbuf = "0.4.8"
 rubato = "0.16.2"
 tracing = "0.1.41"

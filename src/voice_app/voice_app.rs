@@ -17,10 +17,12 @@ use crate::voice_app::{
     app_type::{VoiceAppButton, VoiceAppDeviceComboBox, VoiceAppMicIcon, VoiceAppTabBar},
     audio,
     message::Message,
-    mic_icon::{MicIcon, MIC_ICON_DISABLED, MIC_ICON_ENABLED},
+    mic_icon::{MIC_ICON_DISABLED, MIC_ICON_ENABLED, MicIcon},
     state::State,
     style::{
-        tabs_style, theme, BUTTON_TEXT_SIZE, COMBO_BOX_TEXT_SIZE, CONNECT_BUTTON_HEIGHT, CONNECT_BUTTON_WIDTH, MIC_ICON_HEIGHT, MIC_ICON_WIDTH, SELF_LISTEN_BUTTON_HEIGHT, SELF_LISTEN_BUTTON_WIDTH, TABS_HEIGHT, TABS_TEXT_SIZE
+        BUTTON_TEXT_SIZE, COMBO_BOX_TEXT_SIZE, CONNECT_BUTTON_HEIGHT, CONNECT_BUTTON_WIDTH,
+        MIC_ICON_HEIGHT, MIC_ICON_WIDTH, SELF_LISTEN_BUTTON_HEIGHT, SELF_LISTEN_BUTTON_WIDTH,
+        TABS_HEIGHT, TABS_TEXT_SIZE, tabs_style, theme,
     },
     wrapper::DeviceWrapper,
 };

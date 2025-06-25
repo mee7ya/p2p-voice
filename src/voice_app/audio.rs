@@ -1,7 +1,10 @@
 use std::{
-    net::UdpSocket, sync::{
-        atomic::{AtomicBool, Ordering}, Arc
-    }, thread, usize
+    net::UdpSocket,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread, usize,
 };
 
 use cpal::{
@@ -9,6 +12,7 @@ use cpal::{
     traits::{DeviceTrait, StreamTrait},
 };
 use nnnoiseless::DenoiseState;
+use opus::{Application, Channels, Encoder};
 use ringbuf::{
     HeapRb,
     traits::{Consumer, Observer, Producer, Split},
@@ -213,6 +217,32 @@ fn create_resampler_thread(
     resampler_thread_run
 }
 
+fn create_opus_encoder_thread(producer: P, sample_rate: u32, channels: usize) -> Arc<AtomicBool> {
+    if channels > 2 {
+        panic!("Opus doesn't support more than 2 channels");
+    }
+
+    info!(target: TRACING_TARGET, "Starting encoder thread");
+
+    let encoder_thread_run: Arc<AtomicBool> = Arc::new(true.into());
+    let thread_run: Arc<AtomicBool> = encoder_thread_run.clone();
+
+    thread::spawn(move || {
+        let encoder: Encoder = Encoder::new(
+            sample_rate,
+            if channels == 2 {
+                Channels::Stereo
+            } else {
+                Channels::Mono
+            },
+            Application::Voip,
+        )
+        .expect("Failed to create Opus encoder");
+    });
+
+    encoder_thread_run
+}
+
 #[allow(dead_code)]
 pub struct SelfListen {
     input_stream: Stream,
@@ -295,9 +325,7 @@ impl Drop for SelfListen {
     }
 }
 
-pub struct P2P {
-
-}
+pub struct P2P {}
 
 impl P2P {
     pub fn new(input_device: &Device, output_device: &Device) -> Self {
@@ -314,7 +342,16 @@ impl P2P {
         info!(target: TRACING_TARGET, "Output stream config has {} channel(s), {}Hz sample rate", output_config.channels, output_config.sample_rate.0);
 
         let port: usize = 4000;
-        UdpSocket::bind(format!("0.0.0.0:{port}")).expect("Failed to bind udp socket");
+
+        info!(target: TRACING_TARGET, "Binding UDP socket on port {port}");
+        let socket: UdpSocket =
+            UdpSocket::bind(format!("0.0.0.0:{port}")).expect("Failed to bind udp socket");
+        socket
+            .set_nonblocking(true)
+            .expect("Failed to move socket into nonblocking mode");
+
+        let (encoder_producer, encoder_consumer) = HeapRb::<f32>::new(8192 * 2).split();
+        create_opus_encoder_thread(encoder_producer, 48000, 1);
 
         Self {}
     }
