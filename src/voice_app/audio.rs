@@ -12,7 +12,7 @@ use cpal::{
     traits::{DeviceTrait, StreamTrait},
 };
 use nnnoiseless::DenoiseState;
-use opus::{Application, Channels, Encoder};
+use opus::{Application, Channels, Decoder, Encoder};
 use ringbuf::{
     HeapRb,
     traits::{Consumer, Observer, Producer, Split},
@@ -217,7 +217,12 @@ fn create_resampler_thread(
     resampler_thread_run
 }
 
-fn create_opus_encoder_thread(producer: P, sample_rate: u32, channels: usize) -> Arc<AtomicBool> {
+fn create_opus_encoder_thread(
+    mut consumer: C,
+    sample_rate: u32,
+    channels: usize,
+    sender: UdpSocket,
+) -> Arc<AtomicBool> {
     if channels > 2 {
         panic!("Opus doesn't support more than 2 channels");
     }
@@ -228,7 +233,7 @@ fn create_opus_encoder_thread(producer: P, sample_rate: u32, channels: usize) ->
     let thread_run: Arc<AtomicBool> = encoder_thread_run.clone();
 
     thread::spawn(move || {
-        let encoder: Encoder = Encoder::new(
+        let mut encoder: Encoder = Encoder::new(
             sample_rate,
             if channels == 2 {
                 Channels::Stereo
@@ -238,9 +243,81 @@ fn create_opus_encoder_thread(producer: P, sample_rate: u32, channels: usize) ->
             Application::Voip,
         )
         .expect("Failed to create Opus encoder");
+
+        let mut encoder_input_buffer: Vec<f32> = vec![Sample::EQUILIBRIUM; 960];
+        let mut encoder_output_buffer: Vec<u8> = vec![Sample::EQUILIBRIUM; 960];
+
+        while thread_run.load(Ordering::Relaxed) {
+            if consumer.occupied_len() >= 960 {
+                for sample in encoder_input_buffer.iter_mut() {
+                    *sample = consumer.try_pop().expect("Failed to pop from consumer");
+                }
+
+                let encoded = encoder
+                    .encode_float(&encoder_input_buffer, &mut encoder_output_buffer)
+                    .expect("Failed to encode");
+                if let Err(_e) = sender.send(&encoder_output_buffer[..encoded]) {
+                    continue;
+                }
+            }
+        }
+
+        info!(target: TRACING_TARGET, "Stopping encoder thread");
     });
 
     encoder_thread_run
+}
+
+fn create_opus_decoder_thread(
+    mut producer: P,
+    sample_rate: u32,
+    channels: usize,
+    receiver: UdpSocket,
+) -> Arc<AtomicBool> {
+    if channels > 2 {
+        panic!("Opus doesn't support more than 2 channels");
+    }
+
+    info!(target: TRACING_TARGET, "Starting decoder thread");
+
+    let decoder_thread_run: Arc<AtomicBool> = Arc::new(true.into());
+    let thread_run: Arc<AtomicBool> = decoder_thread_run.clone();
+
+    thread::spawn(move || {
+        let mut decoder: Decoder = Decoder::new(
+            sample_rate,
+            if channels == 2 {
+                Channels::Stereo
+            } else {
+                Channels::Mono
+            },
+        )
+        .expect("Failed to create decoder");
+
+        let mut decoder_input_buffer: Vec<u8> = vec![Sample::EQUILIBRIUM; 960];
+        let mut decoder_output_buffer: Vec<f32> = vec![Sample::EQUILIBRIUM; 960];
+
+        while thread_run.load(Ordering::Relaxed) {
+            if let Ok(received) = receiver.recv(&mut decoder_input_buffer) {
+                let decoded = decoder
+                    .decode_float(
+                        &decoder_input_buffer[..received],
+                        &mut decoder_output_buffer,
+                        false,
+                    )
+                    .expect("Failed to decode");
+                for sample in &decoder_output_buffer[..decoded] {
+                    producer
+                        .try_push(*sample)
+                        .expect("Failed to push to producer");
+                }
+            }
+        }
+
+        info!(target: TRACING_TARGET, "Stopping decoder thread");
+    });
+
+    decoder_thread_run
 }
 
 #[allow(dead_code)]
@@ -325,7 +402,16 @@ impl Drop for SelfListen {
     }
 }
 
-pub struct P2P {}
+#[allow(dead_code)]
+pub struct P2P {
+    input_stream: Stream,
+    output_stream: Stream,
+    resampler_input_thread_run: Arc<AtomicBool>,
+    denoise_thread_run: Arc<AtomicBool>,
+    encoder_thread_run: Arc<AtomicBool>,
+    decoder_thread_run: Arc<AtomicBool>,
+    resampler_output_thread_run: Arc<AtomicBool>,
+}
 
 impl P2P {
     pub fn new(input_device: &Device, output_device: &Device) -> Self {
@@ -349,10 +435,73 @@ impl P2P {
         socket
             .set_nonblocking(true)
             .expect("Failed to move socket into nonblocking mode");
+        socket.connect("127.0.0.1:4000").expect("Failed to connect");
 
-        let (encoder_producer, encoder_consumer) = HeapRb::<f32>::new(8192 * 2).split();
-        create_opus_encoder_thread(encoder_producer, 48000, 1);
+        let socket_sender = socket.try_clone().expect("Failed to clone socket");
 
-        Self {}
+        let (input_producer, input_consumer) = HeapRb::<f32>::new(8192 * 2).split();
+        let (resampler_input_producer, resampler_input_consumer) =
+            HeapRb::<f32>::new(8192 * 2).split();
+        let (denoise_producer, denoise_consumer) = HeapRb::<f32>::new(8192 * 2).split();
+        let (decoder_producer, decoder_consumer) = HeapRb::<f32>::new(8192 * 2).split();
+        let (resampler_output_producer, resampler_output_consumer) =
+            HeapRb::<f32>::new(8192 * 2).split();
+
+        let input_stream = create_input_stream(
+            input_config.channels as usize,
+            input_device,
+            &input_config,
+            input_producer,
+        );
+        let resampler_input_thread_run = create_resampler_thread(
+            1,
+            input_config.sample_rate.0 as usize,
+            48000_usize,
+            input_consumer,
+            resampler_input_producer,
+        );
+        let denoise_thread_run =
+            create_denoise_thread(1, resampler_input_consumer, denoise_producer);
+        let encoder_thread_run =
+            create_opus_encoder_thread(denoise_consumer, 48000_u32, 1, socket_sender);
+        let decoder_thread_run = create_opus_decoder_thread(decoder_producer, 48000_u32, 1, socket);
+        let resampler_output_thread_run = create_resampler_thread(
+            1,
+            48000_usize,
+            output_config.sample_rate.0 as usize,
+            decoder_consumer,
+            resampler_output_producer,
+        );
+        let output_stream = create_output_stream(
+            output_config.channels as usize,
+            output_device,
+            &output_config,
+            resampler_output_consumer,
+        );
+
+        input_stream.play().expect("Failed to play input stream");
+        output_stream.play().expect("Failed to play output stream");
+
+        Self {
+            input_stream,
+            output_stream,
+            resampler_input_thread_run,
+            denoise_thread_run,
+            encoder_thread_run,
+            decoder_thread_run,
+            resampler_output_thread_run,
+        }
+    }
+}
+
+impl Drop for P2P {
+    fn drop(&mut self) {
+        self.denoise_thread_run.store(false, Ordering::Relaxed);
+        self.resampler_input_thread_run
+            .store(false, Ordering::Relaxed);
+        self.encoder_thread_run.store(false, Ordering::Relaxed);
+        self.decoder_thread_run.store(false, Ordering::Relaxed);
+        self.resampler_output_thread_run
+            .store(false, Ordering::Relaxed);
     }
 }

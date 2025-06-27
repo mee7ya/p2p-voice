@@ -15,7 +15,7 @@ use tracing::info;
 use crate::voice_app::{
     app_tracing::TRACING_TARGET,
     app_type::{VoiceAppButton, VoiceAppDeviceComboBox, VoiceAppMicIcon, VoiceAppTabBar},
-    audio,
+    audio::{self, P2P},
     message::Message,
     mic_icon::{MIC_ICON_DISABLED, MIC_ICON_ENABLED, MicIcon},
     state::State,
@@ -60,6 +60,7 @@ impl VoiceApp {
                 .default_output_device()
                 .and_then(|x| Some(DeviceWrapper(x))),
             self_listen: None,
+            p2p: None,
             peer_address: String::new(),
             active_tab: String::from("Action"),
         };
@@ -180,7 +181,16 @@ impl VoiceApp {
             Message::PeerAddressChange(peer_address) => {
                 state.peer_address = peer_address;
             }
-            Message::PeerConnect => {}
+            Message::PeerConnect => {
+                if state.p2p.is_none() {
+                    state.p2p = Some(P2P::new(
+                        &state.input_device.as_ref().unwrap().0,
+                        &state.output_device.as_ref().unwrap().0,
+                    ));
+                } else {
+                    state.p2p = None;
+                }
+            }
             Message::TabSelected(tab) => {
                 state.active_tab = tab;
             }
