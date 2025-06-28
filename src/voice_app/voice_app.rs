@@ -14,13 +14,17 @@ use tracing::info;
 
 use crate::voice_app::{
     app_tracing::TRACING_TARGET,
-    app_type::{VoiceAppButton, VoiceAppDeviceComboBox, VoiceAppMicIcon, VoiceAppTabBar},
-    audio,
+    app_type::{
+        VoiceAppButton, VoiceAppDeviceComboBox, VoiceAppMicIcon, VoiceAppTabBar, VoiceAppTextInput,
+    },
+    audio::{self, P2P},
     message::Message,
-    mic_icon::{MicIcon, MIC_ICON_DISABLED, MIC_ICON_ENABLED},
+    mic_icon::{MIC_ICON_DISABLED, MIC_ICON_ENABLED, MicIcon},
     state::State,
     style::{
-        tabs_style, theme, BUTTON_TEXT_SIZE, COMBO_BOX_TEXT_SIZE, CONNECT_BUTTON_HEIGHT, CONNECT_BUTTON_WIDTH, MIC_ICON_HEIGHT, MIC_ICON_WIDTH, SELF_LISTEN_BUTTON_HEIGHT, SELF_LISTEN_BUTTON_WIDTH, TABS_HEIGHT, TABS_TEXT_SIZE
+        BUTTON_TEXT_SIZE, COMBO_BOX_TEXT_SIZE, CONNECT_BUTTON_HEIGHT, CONNECT_BUTTON_WIDTH,
+        MIC_ICON_HEIGHT, MIC_ICON_WIDTH, SELF_LISTEN_BUTTON_HEIGHT, SELF_LISTEN_BUTTON_WIDTH,
+        TABS_HEIGHT, TABS_TEXT_SIZE, TEXT_INPUT_SIZE, connect_button_style, tabs_style, theme,
     },
     wrapper::DeviceWrapper,
 };
@@ -58,6 +62,7 @@ impl VoiceApp {
                 .default_output_device()
                 .and_then(|x| Some(DeviceWrapper(x))),
             self_listen: None,
+            p2p: None,
             peer_address: String::new(),
             active_tab: String::from("Action"),
         };
@@ -124,7 +129,12 @@ impl VoiceApp {
         )
         .width(CONNECT_BUTTON_WIDTH)
         .height(CONNECT_BUTTON_HEIGHT)
+        .style(connect_button_style)
         .on_press(Message::PeerConnect);
+
+        let peer_text_input: VoiceAppTextInput = text_input("Peer address...", &state.peer_address)
+            .on_input(Message::PeerAddressChange)
+            .size(TEXT_INPUT_SIZE);
 
         let tabs: VoiceAppTabBar = Tabs::new(Message::TabSelected)
             .push(
@@ -148,8 +158,7 @@ impl VoiceApp {
                         .spacing(10)
                         .align_y(Alignment::Center),
                     horizontal_rule(2),
-                    text_input("Peer address...", &state.peer_address)
-                        .on_input(Message::PeerAddressChange),
+                    peer_text_input,
                 ]
                 .padding(10)
                 .spacing(10),
@@ -178,7 +187,17 @@ impl VoiceApp {
             Message::PeerAddressChange(peer_address) => {
                 state.peer_address = peer_address;
             }
-            Message::PeerConnect => {}
+            Message::PeerConnect => {
+                if state.p2p.is_none() {
+                    state.p2p = Some(P2P::new(
+                        &state.input_device.as_ref().unwrap().0,
+                        &state.output_device.as_ref().unwrap().0,
+                        &state.peer_address,
+                    ));
+                } else {
+                    state.p2p = None;
+                }
+            }
             Message::TabSelected(tab) => {
                 state.active_tab = tab;
             }
