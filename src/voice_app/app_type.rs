@@ -1,6 +1,6 @@
 use iced::{
     Renderer, Theme,
-    widget::{Button, Canvas, ComboBox},
+    widget::{Button, Canvas, ComboBox, TextInput},
 };
 use iced_aw::Tabs;
 
@@ -10,3 +10,4 @@ pub type VoiceAppDeviceComboBox<'a> = ComboBox<'a, DeviceWrapper, Message, Theme
 pub type VoiceAppButton<'a> = Button<'a, Message, Theme, Renderer>;
 pub type VoiceAppTabBar<'a> = Tabs<'a, Message, String, Theme, Renderer>;
 pub type VoiceAppMicIcon = Canvas<MicIcon, Message>;
+pub type VoiceAppTextInput<'a> = TextInput<'a, Message, Theme, Renderer>;

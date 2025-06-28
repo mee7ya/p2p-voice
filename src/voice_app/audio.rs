@@ -414,7 +414,7 @@ pub struct P2P {
 }
 
 impl P2P {
-    pub fn new(input_device: &Device, output_device: &Device) -> Self {
+    pub fn new(input_device: &Device, output_device: &Device, peer: &String) -> Self {
         let input_config: StreamConfig = input_device
             .default_input_config()
             .expect("Failed to get default input config")
@@ -427,15 +427,21 @@ impl P2P {
             .into();
         info!(target: TRACING_TARGET, "Output stream config has {} channel(s), {}Hz sample rate", output_config.channels, output_config.sample_rate.0);
 
-        let port: usize = 4000;
-
+        let mut port: usize = 4000;
         info!(target: TRACING_TARGET, "Binding UDP socket on port {port}");
-        let socket: UdpSocket =
-            UdpSocket::bind(format!("0.0.0.0:{port}")).expect("Failed to bind udp socket");
+        let mut socket = UdpSocket::bind(format!("0.0.0.0:{port}"));
+        let mut bind_errors: usize = 0;
+        while socket.is_err() && bind_errors < 3 {
+            bind_errors += 1;
+            port += 1;
+            info!(target: TRACING_TARGET, "Binding failed, using {port} instead");
+            socket = UdpSocket::bind(format!("0.0.0.0:{port}"));
+        }
+        let socket = socket.unwrap_or_else(|_e| panic!("Binding failed, exiting..."));
         socket
             .set_nonblocking(true)
             .expect("Failed to move socket into nonblocking mode");
-        socket.connect("127.0.0.1:4000").expect("Failed to connect");
+        socket.connect(peer).expect("Failed to connect");
 
         let socket_sender = socket.try_clone().expect("Failed to clone socket");
 

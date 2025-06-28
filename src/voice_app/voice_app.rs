@@ -14,7 +14,9 @@ use tracing::info;
 
 use crate::voice_app::{
     app_tracing::TRACING_TARGET,
-    app_type::{VoiceAppButton, VoiceAppDeviceComboBox, VoiceAppMicIcon, VoiceAppTabBar},
+    app_type::{
+        VoiceAppButton, VoiceAppDeviceComboBox, VoiceAppMicIcon, VoiceAppTabBar, VoiceAppTextInput,
+    },
     audio::{self, P2P},
     message::Message,
     mic_icon::{MIC_ICON_DISABLED, MIC_ICON_ENABLED, MicIcon},
@@ -22,7 +24,7 @@ use crate::voice_app::{
     style::{
         BUTTON_TEXT_SIZE, COMBO_BOX_TEXT_SIZE, CONNECT_BUTTON_HEIGHT, CONNECT_BUTTON_WIDTH,
         MIC_ICON_HEIGHT, MIC_ICON_WIDTH, SELF_LISTEN_BUTTON_HEIGHT, SELF_LISTEN_BUTTON_WIDTH,
-        TABS_HEIGHT, TABS_TEXT_SIZE, tabs_style, theme,
+        TABS_HEIGHT, TABS_TEXT_SIZE, TEXT_INPUT_SIZE, connect_button_style, tabs_style, theme,
     },
     wrapper::DeviceWrapper,
 };
@@ -127,7 +129,12 @@ impl VoiceApp {
         )
         .width(CONNECT_BUTTON_WIDTH)
         .height(CONNECT_BUTTON_HEIGHT)
+        .style(connect_button_style)
         .on_press(Message::PeerConnect);
+
+        let peer_text_input: VoiceAppTextInput = text_input("Peer address...", &state.peer_address)
+            .on_input(Message::PeerAddressChange)
+            .size(TEXT_INPUT_SIZE);
 
         let tabs: VoiceAppTabBar = Tabs::new(Message::TabSelected)
             .push(
@@ -151,8 +158,7 @@ impl VoiceApp {
                         .spacing(10)
                         .align_y(Alignment::Center),
                     horizontal_rule(2),
-                    text_input("Peer address...", &state.peer_address)
-                        .on_input(Message::PeerAddressChange),
+                    peer_text_input,
                 ]
                 .padding(10)
                 .spacing(10),
@@ -186,6 +192,7 @@ impl VoiceApp {
                     state.p2p = Some(P2P::new(
                         &state.input_device.as_ref().unwrap().0,
                         &state.output_device.as_ref().unwrap().0,
+                        &state.peer_address,
                     ));
                 } else {
                     state.p2p = None;
